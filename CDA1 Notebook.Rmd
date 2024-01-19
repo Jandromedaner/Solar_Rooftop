@@ -1,0 +1,518 @@
+---
+title: "CDA1 Notebook - Solar Rooftop Challenge"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+# Smart Energy Management for a Single Household in Switerland
+## Time Frame: Data from the year 2021
+
+## Objective
+### The primary goal of this project is to optimize the economic efficiency of a Photovoltaic (PV) system paired with a battery storage unit in a single household in Switzerland. By leveraging data-driven insights, the project aims to make intelligent energy decisions that maximize financial benefits while ensuring efficient energy usage.
+### Beyond optimizing household energy efficiency, this project furthers sustainability initiatives by lessening carbon footprints and advancing the adoption of renewable energy. These efforts collectively contribute towards fostering an eco-friendly community and steering towards a greener, more sustainable future.
+
+## Today's significance of smart energy management in Switzerland
+### The energy sector is rapidly evolving with increased focus on using technology and reducing carbon emissions in buildings. Energy Management Systems (EMS) are becoming more popular. These systems help track and control energy use and production in buildings, leading to more efficient use of energy, increased self-reliance, clear display of energy usage, and cost savings. With the growing installation of solar panels, heat pumps, and electric vehicle charging stations, the importance and use of EMS in managing these technologies are expected to grow further. (https://www.bfe.admin.ch/bfe/en/home/supply/digitalization/ems-market-overview.html) 
+
+
+### Install and import libraries.
+
+```{r}
+# uncomment if you need to install these libraries
+#install.packages("timetk")
+#install.packages("devtools")
+#install.packages("hrbrthemes")
+```
+
+
+```{r}
+library(timetk)
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(hrbrthemes)
+library(ReinforcementLearning)
+```
+
+
+## This section of code is for importing and cleaning our data, ensuring we focus only on the most relevant information for our analysis.
+### Import a random file from 600 datasets in Switzerland, ensuring an unbiased and representative sample of the broader data, enhancing the reliability of conclusions drawn about typical household energy usage patterns in Switzerland.
+
+### And import HPFC-Price Data (In energy trading, the hourly forward curve or hourly price forward curve (HPFC) is the construction of a forward curve at a resolution exceeding that known to the market and is as such able to capture the seasonalities of the electricity spot prices.
+
+
+```{r}
+path_production_data_folder = "/Users/galileo/Documents/DS/CDA1/Zeitreihen/MD_clean2021"
+
+#dfProductionData <- data_frame(files = list.files(path = path_production_data_folder, pattern = 'csv', full.names = T)) %>%
+#  mutate(dfs = map(files, read_csv)) %>%
+#  unnest()
+
+all_files <- list.files(path_production_data_folder, full.names = TRUE)
+random_file <- sample(all_files, 1)
+dfProductionData <- read_csv(random_file)
+
+path_hpfc_data = "/Users/galileo/Documents/DS/CDA1/Zeitreihen/HPFC_2020-10-01_CHF.csv"
+dfHpfc <- read.csv(path_hpfc_data, sep=",", header=TRUE, fill=TRUE, na.string=c(-1,""), stringsAsFactors=FALSE, encoding='utf-8')
+```
+
+
+### To streamline our analysis, we'll remove the 'charging kWh' and 'overshoot kWh' columns from our dataset. These fields are not critical for our current analysis objectives, which focus on optimizing energy decisions for the household. This step will enhance the clarity and efficiency of our data processing, ensuring we concentrate on the most impactful variables for smart energy management.
+
+
+```{r}
+dfProductionData <- dfProductionData[, -which(names(dfProductionData) %in% c("charging kWh", "overshoot kWh"))]
+```
+
+### There are measurement errors in production kWh (negative Values, due to e.g. sensor inaccuracies). We will set them to 0 to avoid incorrect calculations.
+
+
+```{r}
+#print(dfProductionData)
+neg_obs <- dfProductionData %>%
+  filter(`production kWh` < 0)
+#print(neg_obs)
+```
+
+### disable scientific notation
+
+
+```{r}
+options(scipen = 999)
+#print(dfProductionData$`production kWh`)
+```
+
+
+### extract year, month, week, day, hour from Date.time
+
+```{r}
+# date-time from Date.time
+dfHpfc['date-time'] <- as_datetime(dfHpfc$Date.time, format="%d.%m.%Y %H:%M")
+dfHpfc['month'] <- month(dfHpfc$'date-time')
+dfHpfc['week'] <- week(dfHpfc$'date-time')
+dfHpfc['hour'] <- hour(dfHpfc$'date-time')
+dfHpfc['day'] <- day(dfHpfc$'date-time')
+dfHpfc['day_in_week'] <- wday(dfHpfc$'date-time', week_start = 1)
+dfHpfc['day_in_year'] <- yday(dfHpfc$'date-time')
+
+# Delete Date.time column
+dfHpfc <- subset(dfHpfc,select=-c(Date.time))
+
+# tk_ts: Only numeric columns get coerced; Result retains index in numeric format
+dfHpfc$'date-time' <- tk_ts(dfHpfc, start=2021, frequency = 8760) %>% 
+  tk_index(timetk_idx = TRUE)
+```
+
+
+## Data Extraction and Time Zone Adjustment
+### In this part, we extract key details like the date and time from our data. We also adjust for different time zones, ensuring that all our data points are in a uniform time format.
+
+```{r}
+dfHpfc$`date-time` <- parse_date_time(dfHpfc$`date-time`, orders = c("ymd HMs", "ymd"), tz ="Europe/Zurich")
+dfHpfc$`date-time` <- with_tz(dfHpfc$`date-time`, "UTC", ambiguous="earliest")
+
+
+# Identify the first occurrence of "2021-10-31 02:00:00" (because with_tz "UTC" does not convert correctly from summer- to wintertime)
+summer_winter_change <- which(dfHpfc$`date-time` == "2021-10-31 01:00:00")
+
+# Manually adjust date-time for the first occurrence
+dfHpfc$`date-time`[summer_winter_change+1] <- dfHpfc$`date-time`[summer_winter_change+1] - hours(1)
+
+
+dfProductionData$timestamp <- parse_date_time(dfProductionData$timestamp, orders = c("ymd HMs", "ymd"), tz ="Europe/Zurich")
+dfProductionData$timestamp <- with_tz(dfProductionData$timestamp, "UTC", ambiguous="earliest")
+
+# Identify the first occurrence of "2021-10-31 02:00:00" (because with_tz "UTC" does not convert correctly from summer- to wintertime)
+summer_winter_change <- which(dfProductionData$timestamp == "2021-10-31 01:00:00")
+# print(summer_winter_change)
+
+# Manually adjust timestamp for the first occurrence
+dfProductionData$timestamp[summer_winter_change+1] <- dfProductionData$timestamp[summer_winter_change+1] - hours(1)
+
+# rename col from Date.time to date-time
+dfProductionData['date-time'] <- as_datetime(dfProductionData$timestamp)
+dfProductionData['month'] <- month(dfProductionData$'date-time')
+dfProductionData['week'] <- week(dfProductionData$'date-time')
+dfProductionData['hour'] <- hour(dfProductionData$'date-time')
+dfProductionData['day'] <- day(dfProductionData$'date-time')
+dfProductionData['day_in_week'] <- wday(dfProductionData$'date-time', week_start = 1)
+dfProductionData['day_in_year'] <- yday(dfProductionData$'date-time')
+
+#print(dfProductionData)
+# remove Date.time column
+dfProductionData <- subset(dfProductionData,select=-c(timestamp))
+
+# uncomment to see if timechange was correctly fixed
+
+#print(which(dfProductionData$timestamp  == "2021-10-30 24:00:00"))
+#print(dfProductionData$timestamp[2067])
+#print(dfProductionData$timestamp[2068])
+#print(dfProductionData$timestamp[2069])
+#print(dfProductionData$timestamp[7272])
+#print(dfProductionData$timestamp[7273])
+#print(dfProductionData$timestamp[7274])
+#print(dfProductionData$timestamp[7275])
+#print(dfProductionData$timestamp[7276])
+```
+
+
+### Merge HPFC/Price DataFrame and Production DataFrame
+
+```{r}
+dfMerged <- merge(dfProductionData, dfHpfc[,c('date-time', 'Value')], by.x='date-time', by.y='date-time')
+#print(dfMerged)
+```
+
+
+### Convert Price to kWh Unit for easier calculations
+
+```{r}
+dfMerged$grid_buy_price <- dfMerged$Value / 1000  # Convert from CHF/MWh to CHF/kWh
+```
+
+# Visualizations
+
+
+## Average Consumption Hour
+### The following graph displays the mean electricity consumption for each hour throughout the year. It provides a general idea of typical energy usage for each hour.
+### It can be really useful to identify the average peak consumption hour. 
+### We can identify the peak average consumption hours by looking at the highest bars.
+
+```{r}
+peak_value_per_hour <- dfMerged %>% 
+  group_by(day_in_year, hour) %>% 
+  group_by(hour) %>%
+  summarise(mean = mean(`consumption kWh`, na.rn=TRUE))
+
+#print(peak_value_per_hour)
+
+ggplot(peak_value_per_hour, aes(x=hour, y=mean, fill=mean))+
+  geom_bar(stat="identity")+
+  labs(title="Mean Consumption Hour")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+### The peak consumption hours identified in this graph suggest the best times to store or conserve energy in the household.
+
+
+## Median Consumption Hour
+### The following graph displays the median electricity consumption for each hour across the entire year. 
+### The median shows us the middle value in the data, providing a typical level of consumption for each hour.
+
+```{r}
+peak_value_per_hour <- dfMerged %>% 
+  group_by(day_in_year, hour) %>% 
+  group_by(hour) %>%
+  summarise(median = median(`consumption kWh`, na.rn=TRUE))
+
+#print(peak_value_per_hour)
+
+ggplot(peak_value_per_hour, aes(x=hour, y=median, fill=median))+
+  geom_bar(stat="identity")+
+  labs(title="Median Consumption Hour")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+### This graph gives a more balanced view of your hourly electricity usage throughout the year, less influenced by unusual highs or lows (like spikes in usage or periods of minimal activity).
+
+
+## summer/winter seasonality:
+### By concentrating on daily and weekly patterns, I purposely focus on the immediate and practical decisions about energy usage without the added complexity of seasonal changes.
+
+
+## Mean Consumption 
+### The graph shows the average electricity use for each hour throughout the week. This helps you see how your household's energy needs change at different times of the day and on different days of the week.
+### By observing the height of the bars, you can identify which hours have the highest and lowest average consumption for each day. This helps in pinpointing peak and off-peak consumption hours 
+### By understanding your household's energy usage patterns through this graph, you can make smarter decisions about managing and optimizing your PV-system, ensuring you use energy efficiently while also taking advantage of times when you can store or sell excess energy.
+
+```{r}
+mean_value_per_hour_per_day_in_week <- dfMerged %>% 
+  group_by(hour,day_in_week) %>% 
+    summarise(mean = mean(`consumption kWh`, na.rn=TRUE), .groups = 'keep')
+
+#print(mean_value_per_hour_per_day_in_week)
+
+ggplot(mean_value_per_hour_per_day_in_week, aes(x=hour, y=mean, fill=mean))+
+  geom_bar(stat="identity")+
+  facet_wrap(~day_in_week,scales = "free")+
+  labs(title="Mean Consumption per Hour per Day in Week")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+### These graphs show us your energy usage across different days of the week
+### By looking at the different sections for each day, you can see how your energy usage patterns change from weekdays to weekends.
+
+
+## Peak Consumption Hour of the Day
+### The plot displays the peak hours for electricity consumption throughout the year 2021. In simpler terms, it shows which hours of the day had the highest energy usage more frequently throughout the year.
+### The plot helps in identifying which hours are most frequently the peak hours for energy consumption. Hours with taller bars are the ones where the highest electricity usage typically occurs.
+### This information is valuable for making operational decisions, such as scheduling energy-intensive activities during off-peak hours and encourage energy usage shifts.
+
+```{r}
+peak_hour_per_day <- dfMerged %>%
+  group_by(day_in_year) %>%
+  summarise(peak_hour = hour[which.max(`consumption kWh`)])
+
+peak_hours_per_day_in_year <- peak_hour_per_day %>%
+  count(peak_hour, name = "number_occurrences")
+
+  
+# print(peak_hours_per_day_in_year)
+
+ggplot(peak_hours_per_day_in_year, aes(x = factor(peak_hour), y = number_occurrences, fill=number_occurrences)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Peak Consumption Hour of the Day by Number of Occurrences over the Year 2021",
+       x = "Peak Hour",
+       y = "Number Occurrences",
+       fill = "Number Occurrences")
+```
+
+### This graph is about figuring out which hours of the day frequently saw the highest energy consumption.
+### These insights into your houshold's energy usage pattern, enables us to make informed decisions about energy consumption, optimizing your PV-System and battery storage.
+
+
+## Peak Consumption & Peak HPFC-Hour
+### The following graph displays the frequency of peak consumption and peak demand-based pricing (HPFC-Price) for each hour of the day throughout the year 2021.
+### We can identify which hours are most frequently the peak hours for consumption and for demand price. These are the hours where energy usage or cost is typically highest.
+### By comparing the two sets of bars, you can see if there's a correlation between peak consumption times and peak demand price times. For instance, if both peak consumption and peak prices often occur at the same hours, this indicates a direct relationship between usage and price.
+
+```{r}
+peak_hour_per_day_hpfc <- dfMerged %>%
+  group_by(day_in_year) %>%
+  summarise(peak_hour = hour[which.max(Value)])
+
+peak_hours_per_day_in_year_hpfc <- peak_hour_per_day_hpfc %>%
+  count(peak_hour, name = "number_occurrences")
+
+combined_peak_hour <- rbind(
+  transform(peak_hours_per_day_in_year, dataset = "Peak Consumption in 2021"),
+  transform(peak_hours_per_day_in_year_hpfc, dataset = "Peak HPFC-Price in 2021")
+)
+
+
+ggplot(combined_peak_hour, aes(x=factor(peak_hour), y=number_occurrences, fill=dataset))+
+  geom_bar(stat="identity", position = "dodge")+
+  labs(title="Peak Consumption & Peak HPFC-Price per Hour")+
+  xlab("Hour")+
+  ylab("Number Occurences")
+```
+
+### This graph helps understanding when electricity is most used and most expensive in your home.
+### Knowing that, we can better decide when to store energy or when to use stored energy, aligning your consumption with the times when electricity is cheaper.
+
+
+## Price Fluctuation Analysis to set appropriate threshold
+
+```{r}
+# Basic statistics of grid_buy_price
+price_change_stats <- summary(dfMerged$grid_buy_price)
+#print(price_change_stats)
+
+# Calculate price changes
+dfMerged$price_change <- c(NA, diff(dfMerged$grid_buy_price))
+
+# Statistics of price changes
+mean_change <- mean(dfMerged$price_change, na.rm = TRUE)
+median_change <- median(dfMerged$price_change, na.rm = TRUE)
+sd_change <- sd(dfMerged$price_change, na.rm = TRUE)
+
+# Time series plot of price changes
+ggplot(na.omit(dfMerged), aes(x = 1:8759, y = price_change)) +
+  geom_line(color = "blue") +
+  labs(title = "Overview HPFC-Price Changes", x = "Hour", y = "Price Change")
+```
+
+### Price ranges from -0.0222 to 0.0134 with an average near 0 (inidcating relatively stable prices with slight fluctuations)
+### This means that the energy strategy can be consistent and does not need to be very reactive and flexible.
+
+
+## Histogram of HPFC-Price Changes
+
+```{r}
+summary(dfMerged$price_change)
+
+# Histogram of price changes
+ggplot(na.omit(dfMerged), aes(x = price_change)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Histogram of HPFC-Price Changes", x = "Price Change", y = "Frequency")
+```
+
+### We can see here, that the price change is close to zero, that means the price is stable. Also the tallest bar is below 0, which tells us that prices went down a little. 
+### By understanding the patterns and stability in energy prices, we can fine-tune our approach to storing, using, or selling energy. This knowledge allows us to adjust our strategies in real-time, ensuring we capitalize on favorable pricing conditions and avoid unnecessary costs, thereby enhancing our household's overall economic and energy efficiency.
+
+
+## The following code simulates various scenarios of energy usage and pricing to identify a more cost-effective strategy for the houshold.
+
+```{r}
+# Initialize necessary variables
+max_battery_capacity <- 10  # Maximum capacity of the battery
+min_battery_capacity <- 0   # Minimum capacity of the battery (typically a bit higher than 0)
+buy_in_threshold <- 0.04863  # median buy in price
+dfMerged$total_cost_without_actions <- 0  # To track costs when ignoring actions
+dfMerged$total_cost_with_actions <- 0 # To track costs when considering actions
+dfMerged$net_production <- dfMerged$`production kWh` - dfMerged$`consumption kWh` # calculate net production for all rows
+dfMerged$total_income_from_selling <- 0
+dfMerged$total_income_from_selling <- rep(0, nrow(dfMerged))
+
+# Average hourly profiles
+#average_consumption <- aggregate(consumption ~ hour, data=dfMerged, FUN=mean)
+#average_production <- aggregate(`production kWh` ~ hour, data=dfMerged, FUN=mean)
+
+# Shift the grid_buy_price down by one row to create the future_price column
+dfMerged$future_price <- c(dfMerged$grid_buy_price[-1], NA)  # Remove the first price and add NA at the end
+# Set the last value of future_price to the last known price from grid_buy_price
+dfMerged$future_price[nrow(dfMerged)] <- tail(dfMerged$grid_buy_price, 1)
+
+# Shift the `consumption kWh` down by one row to create the future_consumption column
+dfMerged$future_consumption <- c(dfMerged$`consumption kWh`[-1], NA)  # Remove the first value and add NA at the end
+# Set the last value of future_consumption to the last known consumption value
+dfMerged$future_consumption[nrow(dfMerged)] <- tail(dfMerged$`consumption kWh`, 1)
+
+
+# Add a column to store SOC if it doesn't exist
+if (!"SOC" %in% colnames(dfMerged)) {
+  dfMerged$SOC <- 0  # Initialize SOC to 0 as starting value
+}
+
+# Add a column to store actions if it doesn't exist
+if (!"action" %in% colnames(dfMerged)) {
+  dfMerged$action <- NA  # Initialize action to NA
+}
+
+
+for (i in 1:nrow(dfMerged)) {
+  if (i == 1) {
+    dfMerged$total_income_from_selling[i] <- 0
+    dfMerged$total_cost_without_actions[i] <- 0
+    dfMerged$total_cost_with_actions[i] <- 0
+    dfMerged$SOC[i] <- 0  # Assuming you start with an empty battery
+    dfMerged$action[i] <- "Idle"  # Assuming idle action for the first hour
+  } else {
+    # Reset income_this_hour for each iteration
+    income_this_hour <- 0
+    if (dfMerged$net_production[i] > 0) {
+      if (dfMerged$SOC[i-1] < max_battery_capacity) {
+        action <- "Charge"
+        dfMerged$SOC[i] <- min(dfMerged$SOC[i-1] + dfMerged$net_production[i], max_battery_capacity) # only charge battery when it's below the max capacity
+      } else {
+        future_price_diff = dfMerged$grid_buy_price[i] - dfMerged$future_price[i+8]
+        future_consumption_diff = dfMerged$`consumption kWh`[i] - dfMerged$future_consumption[i+8]
+        price_threshold <- 0.001 # conservative enough to sell frequently, but not overly aggressive.
+        consumption_threshold <- 0.1 # 0.1 kWh difference
+        
+        # Predict next few hours' consumption and production
+        #next_hours_consumption <- sum(average_consumption$consumption[hour(dfMerged$datetime[i] + 1:4) %% 24 + 1])
+        #next_hours_production <- sum(average_production$production[hour(dfMerged$datetime[i] + 1:4) %% 24 + 1])
+        # calculate baseline_SOC based on average daily consumption
+        # Calculate desired SOC level
+        #peak_consumption_9am <- 9.096468  # Mean consumption at 09:00
+        #peak_consumption_10am <- 9.454626 # Mean consumption at 10:00
+        #extra_energy_9am <- peak_consumption_9am - baseline_consumption
+        #extra_energy_10am <- peak_consumption_10am - baseline_consumption
+        #desired_SOC_level <- max(0, next_hours_consumption - next_hours_production) + safety_margin
+        
+        #average_daily_consumption = mean(dfMerged$`consumption kWh`) * 24
+        #required_energy_for_coverage = average_daily_consumption * 12 # initially set coverage hours to 12 because overnight there is no solar production
+        #baseline_SOC = (required_energy_for_coverage / max_battery_capacity)
+        
+        if (future_price_diff > price_threshold || future_consumption_diff > consumption_threshold) {
+          action <- "Sell to Grid"
+          income_this_hour <- dfMerged$net_production[i] * dfMerged$grid_buy_price[i]
+        } else {
+          action <- "Idle"
+        }
+      }
+    } else if (dfMerged$SOC[i-1] > min_battery_capacity) {
+      action <- "Discharge"
+      dfMerged$SOC[i] <- max(dfMerged$SOC[i-1] + dfMerged$net_production[i], min_battery_capacity)
+    } else {
+      if (dfMerged$grid_buy_price[i] < buy_in_threshold) {
+        action <- "Buy from Grid"
+        dfMerged$total_cost_with_actions[i] <- dfMerged$total_cost_with_actions[i-1] + abs(dfMerged$net_production[i]) * dfMerged$grid_buy_price[i]
+      } else {
+        action <- "Idle"
+      }
+    }
+
+    # Update costs without actions
+    dfMerged$total_cost_without_actions[i] <- dfMerged$total_cost_without_actions[i-1]
+    if (dfMerged$net_production[i] < 0) {
+      dfMerged$total_cost_without_actions[i] <- dfMerged$total_cost_without_actions[i] + abs(dfMerged$net_production[i]) * dfMerged$grid_buy_price[i]
+    }
+
+    # Update the cumulative total income from selling
+    dfMerged$total_income_from_selling[i] <- dfMerged$total_income_from_selling[i-1] + income_this_hour
+
+    # Store the action for each hour for analysis
+    dfMerged$action[i] <- action
+  }
+}
+
+#summary(dfMerged$net_production)
+#tail(dfMerged, n = 10)  # Check the last few rows
+
+print(paste("Final total cost without considering actions:", tail(dfMerged$total_cost_without_actions, 1)))
+print(paste("Total cost with considering actions:", tail(dfMerged$total_cost_with_actions, 1)))
+net_cost_with_actions <- tail(dfMerged$total_cost_with_actions, 1) - tail(dfMerged$total_income_from_selling, 1)
+print(paste("Final total net cost with considering actions:", net_cost_with_actions))
+```
+
+
+## Total income from selling energy over the course of the year
+
+```{r}
+ggplot(dfMerged, aes(x=...1, y=total_income_from_selling))+
+  geom_line()+
+  theme_minimal()+
+  labs(title = "Total Income from Selling Over Time",
+       x = "Hour",
+       y = "Total Income from Selling") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Comparison of Results
+
+```{r}
+# prepare the final data
+summary_data <- data.frame(
+  Category = c("Total Cost Without Actions", "Total Cost With Actions", "Net Cost With Actions"),
+  Value = c(tail(dfMerged$total_cost_without_actions, 1), 
+            tail(dfMerged$total_cost_with_actions, 1), 
+            tail(dfMerged$total_cost_with_actions, 1) - tail(dfMerged$total_income_from_selling, 1))
+)
+
+# Adjust your ggplot code as needed
+plot <- ggplot(summary_data, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(Value, 2)), hjust = -0.3, color = "black") +
+  scale_y_continuous(labels = scales::comma, position = "right") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Comparison of Costs",
+       x = "Category",
+       y = "Total Cost",
+       fill = "Cost Category:") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.y = element_text(angle = 0, hjust = 1),
+        legend.position = "bottom") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+# Save the plot with specified dimensions
+# ggsave("Comparison_of_Costs.png", plot = plot, width = 16, height = 9, units = "in")
+print(plot)
+```
+
+
+## Conclusion
+### This project showcases how data science in the realm of renewable energy and sustainable living. It demonstrates how households can leverage technology and data to make informed decisions that benefit both the environment and their finances. The insights from this project can help housholds like yours make smarter choices about when to use, store, or sell solar energy, leading to cost savings and more efficient energy use. 
+
+
+### In summary, this project is a sophisticated endeavor to harmonize economic benefits with sustainable energy practices in a household setting, using the power of data analysis to make intelligent, real-time decisions regarding energy management.
+
+
+### As we look ahead, this project sets the groundwork for further advancements in smart energy management. Future steps include enhancing the model's predictive capabilities, integrating real-time weather data, and exploring machine learning algorithms for more dynamic decision-making. The adaptable nature of our model holds promise for scaling up to larger communities or neighborhoods, offering a blueprint for widespread sustainable energy practices and contributing significantly to broader environmental goals.

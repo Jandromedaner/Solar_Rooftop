@@ -1,0 +1,783 @@
+---
+title: "CDA1 - Solar Rooftop Challenge"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+
+
+```{r}
+#install.packages("timetk")
+#install.packages("devtools")
+#install.packages("hrbrthemes")
+#devtools::install_github('nproellochs/ReinforcementLearning')
+```
+
+
+```{r}
+library(timetk)
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(hrbrthemes)
+library(ReinforcementLearning)
+```
+
+# Import all Data
+
+```{r}
+path_production_data_folder = "/Users/galileo/Documents/DS/CDA1/Zeitreihen/MD_clean2021"
+
+#dfProductionData <- data_frame(files = list.files(path = path_production_data_folder, pattern = 'csv', full.names = T)) %>%
+#  mutate(dfs = map(files, read_csv)) %>%
+#  unnest()
+```
+
+# Import Date from just 1 file
+```{r}
+all_files <- list.files(path_production_data_folder, full.names = TRUE)
+random_file <- sample(all_files, 1)
+dfProductionData <- read_csv(random_file)
+```
+
+
+## Get some facts about the structure of the ProductionData- and the HPFC- dataframe
+
+```{r}
+help(timetk)
+summary(dfProductionData$timestamp)
+summary(dfProductionData)
+typeof(dfProductionData)
+```
+# Convert timestamp to timetk ts
+```{r}
+#print(dfProductionData$'timestamp')
+#dfProductionData$'timestamp' <- tk_ts(dfProductionData, start=2021, frequency = 8760) %>% 
+#  tk_index(timetk_idx = TRUE)
+
+
+#dfProductionData$'timestamp' <- parse_date_time(dfProductionData$'timestamp' , c("ymd", "ymd HMs"), tz="Europe/Zurich")
+dfProductionData$timestamp <- parse_date_time(dfProductionData$timestamp, orders = c("ymd HMs", "ymd"), tz ="Europe/Zurich")
+dfProductionData$timestamp <- with_tz(dfProductionData$timestamp, "UTC", ambiguous="earliest")
+
+
+# Identify the first occurrence of "2021-10-31 02:00:00" (because with_tz "UTC" does not convert correctly from summer- to wintertime)
+summer_winter_change <- which(dfProductionData$timestamp == "2021-10-31 01:00:00")
+#print(summer_winter_change)
+# Manually adjust timestamp for the first occurrence
+print(dfProductionData$timestamp[summer_winter_change+1])
+dfProductionData$timestamp[summer_winter_change+1] <- dfProductionData$timestamp[summer_winter_change+1] - hours(1)
+
+# date-time from Date.time
+print(as_datetime(dfProductionData$timestamp))
+dfProductionData['date-time'] <- as_datetime(dfProductionData$timestamp)
+dfProductionData['month'] <- month(dfProductionData$'date-time')
+dfProductionData['week'] <- week(dfProductionData$'date-time')
+dfProductionData['hour'] <- hour(dfProductionData$'date-time')
+dfProductionData['day'] <- day(dfProductionData$'date-time')
+dfProductionData['day_in_week'] <- wday(dfProductionData$'date-time', week_start = 1)
+dfProductionData['day_in_year'] <- yday(dfProductionData$'date-time')
+
+print(dfProductionData)
+# Delete Date.time column
+dfProductionData <- subset(dfProductionData,select=-c(timestamp))
+#print(which(dfProductionData$timestamp  == "2021-10-30 24:00:00"))
+#View(dfProductionData)
+#print(dfProductionData$timestamp[2067])
+#print(dfProductionData$timestamp[2068])
+#print(dfProductionData$timestamp[2069])
+#print(dfProductionData$timestamp[7272])
+#print(dfProductionData$timestamp[7273])
+#print(dfProductionData$timestamp[7274])
+#print(dfProductionData$timestamp[7275])
+#print(dfProductionData$timestamp[7276])
+```
+
+
+## We don't need the columns charging kWh and overshoot kWh so we'll delete them
+
+```{r}
+dfProductionData <- dfProductionData[, -which(names(dfProductionData) %in% c("charging kWh", "overshoot kWh"))]
+```
+
+# We don't need the rows that have no production kWh and consumption kWh value, so we'll delete them??
+
+# There are measurement errors in production kWh (- Values). We'll set them to 0 to avoid wrong calculations.
+```{r}
+print(dfProductionData)
+neg_obs <- dfProductionData %>%
+  filter(`production kWh` < 0)
+#print(neg_obs)
+```
+
+
+# Temporarily disable scientific notation
+
+```{r}
+options(scipen = 999)
+print(dfProductionData$`production kWh`)
+```
+
+
+## aggregate HPFC Demand 
+```{r}
+path_hpfc_data = "/Users/galileo/Documents/DS/CDA1/Zeitreihen/HPFC_2020-10-01_CHF.csv"
+dfHpfc <- read.csv(path_hpfc_data, sep=",", header=TRUE, fill=TRUE, na.string=c(-1,""), stringsAsFactors=FALSE, encoding='utf-8')
+```
+
+# aggregate year, month, week, day, hour from Date.time
+
+```{r}
+# date-time from Date.time
+dfHpfc['date-time'] <- as_datetime(dfHpfc$Date.time, format="%d.%m.%Y %H:%M")
+dfHpfc['month'] <- month(dfHpfc$'date-time')
+dfHpfc['week'] <- week(dfHpfc$'date-time')
+dfHpfc['hour'] <- hour(dfHpfc$'date-time')
+dfHpfc['day'] <- day(dfHpfc$'date-time')
+dfHpfc['day_in_week'] <- wday(dfHpfc$'date-time', week_start = 1)
+dfHpfc['day_in_year'] <- yday(dfHpfc$'date-time')
+
+# Delete Date.time column
+dfHpfc <- subset(dfHpfc,select=-c(Date.time))
+
+#summary(dfHpfc)
+# tk_ts: Only numeric columns get coerced; Result retains index in numeric format
+dfHpfc$'date-time' <- tk_ts(dfHpfc, start=2021, frequency = 8760) %>% 
+  tk_index(timetk_idx = TRUE)
+```
+
+# Time change and conversion to UTC time
+```{r}
+#print(dfHpfc$'date-time')
+
+#dfHpfc$'date-time' <- parse_date_time(dfHpfc$'date-time' , c("ymd", "ymd HMs"), tz="Europe/Zurich")
+dfHpfc$`date-time` <- parse_date_time(dfHpfc$`date-time`, orders = c("ymd HMs", "ymd"), tz ="Europe/Zurich")
+dfHpfc$`date-time` <- with_tz(dfHpfc$`date-time`, "UTC", ambiguous="earliest")
+
+#print(dfHpfc$`date-time`)
+# Identify the first occurrence of "2021-10-31 02:00:00" (because with_tz "UTC" does not convert correctly from summer- to wintertime)
+summer_winter_change <- which(dfHpfc$`date-time` == "2021-10-31 01:00:00")
+#print(summer_winter_change)
+# Manually adjust date-time for the first occurrence
+#print(dfHpfc$`date-time`[summer_winter_change+1])
+dfHpfc$`date-time`[summer_winter_change+1] <- dfHpfc$`date-time`[summer_winter_change+1] - hours(1)
+
+#print(which(dfHpfc$`date-time`  == "2021-10-30 24:00:00"))
+summary(dfHpfc)
+summary(dfProductionData)
+#print(dfHpfc$`date-time`[2067])
+#print(dfHpfc$`date-time`[2068])
+#print(dfHpfc$`date-time`[2069])
+#print(dfHpfc$`date-time`[7272])
+#print(dfHpfc$`date-time`[7273])
+#print(dfHpfc$`date-time`[7274])
+#print(dfHpfc$`date-time`[7275])
+#print(dfHpfc$`date-time`[7276])
+```
+# Integrate dfHpfc Price into dfProductionData
+
+```{r}
+dfMerged <- merge(dfProductionData, dfHpfc[,c('date-time', 'Value')], by.x='date-time', by.y='date-time')
+print(dfMerged)
+```
+
+# Convert Price to kWh Unit for easier calculations
+```{r}
+dfMerged$grid_buy_price <- dfMerged$Value / 1000  # Convert from CHF/MWh to CHF/kWh
+```
+
+
+# TODO Consumption Analysis
+
+```{r}
+print(dfMerged)
+consumption <- dfMerged$`consumption kWh`
+ggplot(dfMerged, aes(x=`date-time`, y=consumption)) +
+  geom_line()+
+  theme_ipsum()+
+  labs(title="Consumption in 2021")+
+  xlab("Hour")+
+  ylab("")
+```
+
+
+# Max consumption
+```{r}
+peak_value_per_hour <- dfMerged %>% 
+  group_by(hour) %>% 
+  summarise(max = max(`consumption kWh`, na.rn=TRUE))
+
+print(peak_value_per_hour)
+
+ggplot(peak_value_per_hour, aes(x=hour, y=max, fill=max))+
+  geom_bar(stat="identity")+
+  labs(title="Max Consumption Hour")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+# Mean Consumption hour
+```{r}
+peak_value_per_hour <- dfMerged %>% 
+  group_by(day_in_year, hour) %>% 
+  group_by(hour) %>%
+  summarise(mean = mean(`consumption kWh`, na.rn=TRUE))
+
+print(peak_value_per_hour)
+
+ggplot(peak_value_per_hour, aes(x=hour, y=mean, fill=mean))+
+  geom_bar(stat="identity")+
+  labs(title="Mean Consumption Hour")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+## Median Consumption hour
+
+```{r}
+peak_value_per_hour <- dfMerged %>% 
+  group_by(day_in_year, hour) %>% 
+  group_by(hour) %>%
+  summarise(median = median(`consumption kWh`, na.rn=TRUE))
+
+print(peak_value_per_hour)
+
+ggplot(peak_value_per_hour, aes(x=hour, y=median, fill=median))+
+  geom_bar(stat="identity")+
+  labs(title="Median Consumption Hour")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+# get mean Consumption hour per Day in week
+# Mean is sensitive to outliers! and reflects the central tendency.
+```{r}
+mean_value_per_hour_per_day_in_week <- dfMerged %>% 
+  group_by(hour,day_in_week) %>% 
+    summarise(mean = mean(`consumption kWh`, na.rn=TRUE), .groups = 'keep')
+
+print(mean_value_per_hour_per_day_in_week)
+
+ggplot(mean_value_per_hour_per_day_in_week, aes(x=hour, y=mean, fill=mean))+
+  geom_bar(stat="identity")+
+  facet_wrap(~day_in_week,scales = "free")+
+  labs(title="Mean Consumption per Hour per Day in Week")+
+  xlab("Hour")+
+  ylab("Consumption")
+```
+
+# get peak hour per Day by Number of Occurences over the Year 2021.
+```{r}
+peak_hour_per_day <- dfMerged %>%
+  group_by(day_in_year) %>%
+  summarise(peak_hour = hour[which.max(`consumption kWh`)])
+
+peak_hours_per_day_in_year <- peak_hour_per_day %>%
+  count(peak_hour, name = "number_occurrences")
+
+  
+print(peak_hours_per_day_in_year)
+
+ggplot(peak_hours_per_day_in_year, aes(x = factor(peak_hour), y = number_occurrences, fill=number_occurrences)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Peak Hour of the Day by Number of Occurrences over the Year 2021",
+       x = "Peak Hour",
+       y = "Number Occurrences",
+       fill = "Number Occurrences")
+```
+
+## TODO Consumption / HPFC Side by Side
+```{r}
+peak_hour_per_day_hpfc <- dfMerged %>%
+  group_by(day_in_year) %>%
+  summarise(peak_hour = hour[which.max(Value)])
+
+peak_hours_per_day_in_year_hpfc <- peak_hour_per_day_hpfc %>%
+  count(peak_hour, name = "number_occurrences")
+
+combined_peak_hour <- rbind(
+  transform(peak_hours_per_day_in_year, dataset = "Peak Consumption in 2021"),
+  transform(peak_hours_per_day_in_year_hpfc, dataset = "Peak Demand (HPFC-Price) in 2021")
+)
+
+print(combined_peak_hour)
+
+
+ggplot(combined_peak_hour, aes(x=factor(peak_hour), y=number_occurrences, fill=dataset))+
+  geom_bar(stat="identity", position = "dodge")+
+  labs(title="Peak Consumption & Highest HPFC-Price per Hour")+
+  xlab("Hour")+
+  ylab("Number Occurences")
+```
+
+# From this graph we can see in which hours Prices and Consumption are relatively high to each other
+# But be careful, they are the peak hours of the day
+
+
+# Define current_state and Actions
+```{r}
+# current_state are: Numerically represent the state of the simulation -> The state representation needs to involve all of the information that our agent needs for training. (Necessary Info: soc, HPFC-Value (next 12 hours), consumption kWh (next 12 hours))
+
+#print(sum(current_state[1:13])/1000 * sum(day_ahead_consumption) * (-1))
+#print(sum(current_state[1:13])/1000 * sum(day_ahead_consumption) * (-1) + sum(day_ahead_production) * (sum(current_state[1:13])/1000))
+
+# Actions are: Representing the possible actions (things that our agent can make with our battery) numerically. Representing and updating the current state of the home battery. (Nummeric Value of profit we can make now or a few hours in)
+
+#battery is charged from the grid
+#battery sends energy to the grid ??
+#battery fulfills household’s energy need 
+#battery charges from solar panels production  
+#battery participates in hpfc frequency market 
+#battery doesn’t do anything (stays idle)
+actions <- c("bat_from_grid", "bat_to_grid", "bat_to_home", "bat_from_pv", "bat_idle")
+
+# TODO normalize values/vector???
+
+shift_hour <- function(current_state){
+  now <- current_state[1+1,]
+  day_ahead_hpfc <- dfMerged[which(between(dfMerged$`date-time`, now$`date-time`, now$`date-time` + hours(12))), ]
+  #print(day_ahead_hpfc$Value)
+  
+  # later convert to array() or dict
+  day_ahead_production <- dfMerged[which(between(dfMerged$timestamp, now$`date-time`, now$`date-time` + hours(12))), ]
+  #print(day_ahead_production)
+  
+  # define the information about the battery (vector of length 4): capacity in kWh, current charge level of the battery (0) in kWh, max charge power in kWh (5kWh?), minimum allowed charge level in kWh (1kWh?)
+  batt_inf <- c(10,0,5,1)
+  
+  current_state <- c(day_ahead_hpfc$Value, day_ahead_production$`consumption kWh`, day_ahead_production$`production kWh`, batt_inf)
+}
+```
+
+# Now we need to aggregate the state of charge. As described, this is 0 at the start of the year. 
+# Also we have to set the upper limit. (Battery is limited to 10 kWh)
+# minimum charge allowed (0) maximum charge power ()?
+```{r}
+# Initialize necessary variables
+max_battery_capacity <- 10  # Maximum capacity of the battery
+min_battery_capacity <- 0   # Minimum capacity of the battery (typically a bit higher than 0)
+buy_in_threshold <- 0.04863  # Example threshold
+dfMerged$total_cost_without_actions <- 0  # To track costs when ignoring actions
+dfMerged$total_cost_with_actions <- 0 # To track costs when considering actions
+dfMerged$net_production <- dfMerged$`production kWh` - dfMerged$`consumption kWh` # calculate net production for all rows
+dfMerged$total_income_from_selling <- 0
+dfMerged$total_income_from_selling <- rep(0, nrow(dfMerged))
+
+# Shift the grid_buy_price down by one row to create the future_price column
+dfMerged$future_price <- c(dfMerged$grid_buy_price[-1], NA)  # Remove the first price and add NA at the end
+# Set the last value of future_price to the last known price from grid_buy_price
+dfMerged$future_price[nrow(dfMerged)] <- tail(dfMerged$grid_buy_price, 1)
+
+# Shift the `consumption kWh` down by one row to create the future_consumption column
+dfMerged$future_consumption <- c(dfMerged$`consumption kWh`[-1], NA)  # Remove the first value and add NA at the end
+# Set the last value of future_consumption to the last known consumption value
+dfMerged$future_consumption[nrow(dfMerged)] <- tail(dfMerged$`consumption kWh`, 1)
+
+
+# Add a column to store SOC if it doesn't exist
+if (!"SOC" %in% colnames(dfMerged)) {
+  dfMerged$SOC <- 0  # Initialize SOC to 0 as starting value
+}
+
+# Add a column to store actions if it doesn't exist
+if (!"action" %in% colnames(dfMerged)) {
+  dfMerged$action <- NA  # Initialize action to NA
+}
+
+
+for (i in 1:nrow(dfMerged)) {
+  if (i == 1) {
+    dfMerged$total_income_from_selling[i] <- 0
+    dfMerged$total_cost_without_actions[i] <- 0
+    dfMerged$total_cost_with_actions[i] <- 0
+    dfMerged$SOC[i] <- 0  # Assuming you start with an empty battery
+    dfMerged$action[i] <- "Idle"  # Assuming idle action for the first hour
+  } else {
+    # Reset income_this_hour for each iteration
+    income_this_hour <- 0
+
+    if (dfMerged$net_production[i] > 0) {
+      if (dfMerged$SOC[i-1] < max_battery_capacity) {
+        action <- "Charge"
+        dfMerged$SOC[i] <- min(dfMerged$SOC[i-1] + dfMerged$net_production[i], max_battery_capacity)
+      } else {
+        future_price_diff = dfMerged$grid_buy_price[i] - dfMerged$future_price[i+1]
+        future_consumption_diff = dfMerged$`consumption kWh`[i] - dfMerged$future_consumption[i+1]
+
+        price_threshold <- 0.05
+        consumption_threshold <- 0.1 * 1
+
+        if (future_price_diff > price_threshold || future_consumption_diff > consumption_threshold) {
+          action <- "Sell to Grid"
+          income_this_hour <- dfMerged$net_production[i] * dfMerged$grid_buy_price[i]
+        } else {
+          action <- "Idle"
+        }
+      }
+    } else if (dfMerged$SOC[i-1] > min_battery_capacity) {
+      action <- "Discharge"
+      dfMerged$SOC[i] <- max(dfMerged$SOC[i-1] + dfMerged$net_production[i], min_battery_capacity)
+    } else {
+      if (dfMerged$grid_buy_price[i] < buy_in_threshold) {
+        action <- "Buy from Grid"
+        dfMerged$total_cost_with_actions[i] <- dfMerged$total_cost_with_actions[i-1] + abs(dfMerged$net_production[i]) * dfMerged$grid_buy_price[i]
+      } else {
+        action <- "Idle"
+      }
+    }
+
+    # Update costs without actions
+    dfMerged$total_cost_without_actions[i] <- dfMerged$total_cost_without_actions[i-1]
+    if (dfMerged$net_production[i] < 0) {
+      dfMerged$total_cost_without_actions[i] <- dfMerged$total_cost_without_actions[i] + abs(dfMerged$net_production[i]) * dfMerged$grid_buy_price[i]
+    }
+
+    # Update the cumulative total income from selling
+    dfMerged$total_income_from_selling[i] <- dfMerged$total_income_from_selling[i-1] + income_this_hour
+
+    # Store the action for each hour for analysis
+    dfMerged$action[i] <- action
+  }
+}
+
+ggplot(dfMerged, aes(x=...1, y=total_income_from_selling))+
+  geom_line()+
+  theme_minimal()+
+  labs(title = "Total Income from Selling Over Time",
+       x = "Hour",
+       y = "Total Income from Selling") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+tail(dfMerged, n = 10)  # Check the last few rows
+
+
+print(paste("Final total cost without considering actions:", tail(dfMerged$total_cost_without_actions, 1)))
+print(paste("Total cost with considering actions:", tail(dfMerged$total_cost_with_actions, 1)))
+net_cost_with_actions <- tail(dfMerged$total_cost_with_actions, 1) - tail(dfMerged$total_income_from_selling, 1)
+print(paste("Final total net cost with considering actions:", net_cost_with_actions))
+summary(dfMerged$total_income_from_selling)
+
+# View the result
+View(dfMerged)
+```
+
+```{r}
+# prepare the final data
+summary_data <- data.frame(
+  Category = c("Total Cost Without Actions", "Total Cost With Actions", "Net Cost With Actions"),
+  Value = c(tail(dfMerged$total_cost_without_actions, 1), 
+            tail(dfMerged$total_cost_with_actions, 1), 
+            tail(dfMerged$total_cost_with_actions, 1) - tail(dfMerged$total_income_from_selling, 1))
+)
+
+# Adjust your ggplot code as needed
+plot <- ggplot(summary_data, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(Value, 2)), hjust = -0.3, color = "black") +
+  scale_y_continuous(labels = scales::comma, position = "right") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Comparison of Costs",
+       x = "Category",
+       y = "Total Cost",
+       fill = "Cost Category") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.y = element_text(angle = 0, hjust = 1),
+        legend.position = "bottom") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+# Save the plot with specified dimensions
+ggsave("Comparison_of_Costs.png", plot = plot, width = 16, height = 9, units = "in")
+
+print(plot)
+
+
+
+print(tail(dfMerged$total_cost_with_actions,1))
+```
+
+
+# Some aditional Analyses I did to get Insights
+# analyze SOC during negative net production
+# These are the periods where consumption exceeds production. I want to understand the system's behaviour in these critical moments.
+
+```{r}
+negative_net_production <- dfMerged[dfMerged$net_production < 0, ]
+negative_net_production$`date-time` <- as.POSIXct(negative_net_production$`date-time`, format = "%Y-%m-%d %H:%M:%S")
+
+summary(negative_net_production$SOC)
+summary(negative_net_production$net_production)
+
+ggplot(negative_net_production, 
+  aes(x = `date-time`, y = SOC)) +
+  geom_line() +
+  geom_point(data = subset(negative_net_production, SOC < buy_in_threshold), color = "red") +
+  labs(title = "State of Charge During Negative Net Production", x = "Time", y = "SOC") +
+  coord_cartesian(ylim=c(0, 0.05))
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Developing a logic of what it means to make a specific action in the environment. In other words, expressing what would happen with the household, battery and the energy cost when specific action is carried out by the agent.
+#Q <- matrix(0, nrow=length(current_state), ncol=length(actions))
+
+# calculate new battery values and shift to next hour
+View(dfMerged)
+next_state <- function(current_state, actions) {
+    
+  day_ahead_hpfc <- current_state[1:13]
+  day_ahead_consumption <- current_state[14:26]
+  day_ahead_production <- current_state[27:39]
+  batt_inf <- current_state[40:41]
+  day_ahead_hpfc <- dfHpfc[which(between(dfHpfc$`date-time`, dfHpfc$`date-time` + hours(1), dfHpfc$`date-time` + hours(12))), ]
+  print(day_ahead_hpfc)
+  day_ahead_production <- dfProductionData[which(between(dfProductionData$timestamp, dfHpfc$`timestamp` + hours(1), dfHpfc$`timestamp` + hours(12))), ]
+  batt_inf <- batt_inf
+
+  
+  
+  if (action == "bat_from_grid"){ 
+    batt_inf[2] <- batt_inf[2] - batt_inf[1] #battr_info-current_charge = current_charge - capacity 
+  }
+  if (action == "bat_to_grid") {
+    batt_inf[2] <- batt_inf[2] - batt_inf[2]# battr_info-current_charge = 0 
+  }
+  if (action == "bat_to_home"){ 
+    batt_inf[2] <- batt_inf[2] - sum(day_ahead_consumption[1])
+    if (batt_inf[2] < 0) batt_inf[2] <- batt_inf[2] - batt_inf[2] # if battr_info-current_charge is negative set to 0
+  }
+  if (action == "bat_from_pv"){
+    batt_inf[2] <- batt_inf[2] + sum(day_ahead_production[1])  #battr_info-current_charge = current_charge + production
+    if (batt_inf[2] > batt_inf[1])  batt_inf[2] <- batt_inf[1] # if battr_info_current_charge > capacity set current_charge to capacity
+  }
+  if (action == "bat_idle") {
+  }
+  
+  # update data / state
+  current_state <- c(day_ahead_hpfc, day_ahead_consumption, day_ahead_production, batt_inf)
+  return(current_state)
+}
+
+# Define the reward function
+# TODO fix logic of bat_to_home (day_ahead timestamp not in current_state data...)
+#new_state <- next_state_df
+#print(new_state)
+# TODO Calculate reward based on decisions in the future. (Probably need to define a table with each decision)
+reward <- function(new_state, actions) {
+  
+  day_ahead_hpfc_state <- new_state[1:13]
+  day_ahead_consumption <- new_state[14:26]
+  day_ahead_production <- new_state[27:39]
+  batt_inf <- new_state[40:43]
+  r<-0
+  if (action == "bat_from_grid"){ 
+    r <- day_ahead_hpfc_state[1]/1000 * day_ahead_consumption[1] * (-1) + day_ahead_production[1] * day_ahead_hpfc_state[1]/1000 - day_ahead_hpfc_state/1000 * (batt_inf[1] - batt_inf[2]) # pay for consumption and sell production 
+    # calc all costs/revenue associated to this action (for now that's just day_ahead_hpfc_price / 1000 because it's in mWh * consumption in kWh * -1 because you have to pay for that) + revenue from pv_production
+  }
+  if (action == "bat_to_grid") {
+    r <- sum(day_ahead_consumption[1]) * (-1) * sum(day_ahead_hpfc_state[1])/1000 + batt_inf[2] * sum(day_ahead_hpfc_state[1])/1000 + sum(day_ahead_production[1]) * sum(day_ahead_hpfc_state)/1000
+    # calc all costs/revenue associated to this action (battr_info-current_charge * day_ahead_hpfc_price / 1000 + consumption * day_ahead_hpfc_price / 1000 * -1 + production * day_ahead_hpfc_price / 1000) ()
+  }
+  if (action == "bat_to_home"){ 
+    r <- (batt_inf[2] - sum(day_ahead_consumption[1])) * sum(day_ahead_hpfc_state[1])/1000 + sum(day_ahead_production[1]) * sum(day_ahead_hpfc_state[1])/1000   # use battery for consumption and pay the rest and sell production and 
+
+  }
+  if (action == "bat_from_pv"){
+    r <- sum(day_ahead_consumption[1]) * (-1) * sum(day_ahead_hpfc_state[1])/1000 + (sum(day_ahead_production[1]) - (batt_inf[1] - batt_inf[2]) * sum(day_ahead_hpfc_state[1])/1000) # pay for consumption and sell production
+    # battr_info-current_charge = current_charge + production and then return all costs/revenue associated to this action (for now that's just day_ahead_hpfc_price / 1000 because it's in mWh * consumption in kWh * -1 because you have to pay for that) + revenue from pv_production
+  }
+  if (action == "bat_idle") {
+    r <- sum(day_ahead_consumption) * (-1) * sum(day_ahead_hpfc_state)/1000 + sum(day_ahead_production) * sum(day_ahead_hpfc_state)/1000 # pay for consumption and sell production
+  }
+  return(r)
+}
+
+#new_state <- next_state(current_state, actions) 
+#reward_value <- reward(new_state, actions)
+
+# Run the reinforcement learning algorithm
+#rl <- ReinforcementLearning(data=data ,states=new_state, actions=actions, Q=Q, reward=reward, alpha=0.1, gamma=0.9)
+
+```
+
+
+```{r}
+# first testrun
+#print(dfHpfc)
+first_state <- dfHpfc[1,]
+day_ahead_hpfc <- dfHpfc[which(between(dfHpfc$`date-time`, first_state$`date-time`, first_state$`date-time` + hours(12))), ]
+print(dfProductionData)
+day_ahead_production <- dfProductionData[which(between(dfProductionData$`date-time`, first_state$`date-time`, first_state$`date-time` + hours(12))), ]
+batt_inf <- c(10,0)
+
+print(day_ahead_hpfc$Value)
+current_state <- c(day_ahead_hpfc$Value, day_ahead_production$`consumption kWh`, day_ahead_production$`production kWh`, batt_inf)
+
+
+# TODO policy (if HPFC max value in next 12 hours then sell in this hour. Min value in next 12 hours, then buy)
+day_ahead_hpfc_state <- current_state[1:13]
+day_ahead_consumption <- current_state[14:26]
+day_ahead_production <- current_state[27:39]
+batt_inf <- current_state[40:43]
+action = "bat_idle"
+if (day_ahead_consumption[1] < 5) {
+  if (day_ahead_consumption[1] < 3) {
+    if (day_ahead_consumption[1] < 2) {
+      if (day_ahead_consumption[1] < 1) {
+        if (batt_inf[1] > 0) {
+          action <- "bat_to_grid"
+        } else {
+          action <- "bat_idle"
+        }
+      } else {
+        action <- "bat_from_pv"
+      }
+    } else if (batt_inf[1] > 0) {
+      action <- "bat_to_home"
+    } else {
+      action <- "bat_idle"
+    }
+  } else if (day_ahead_production[1] > 0) {
+    action <- "bat_from_grid"
+  } else {
+    action <- "bat_idle"
+  }
+} else {
+  action <- "bat_idle"
+}
+
+
+  #action <- sample(actions, 1) # randomly choose an action!!
+for (i in 1:10) {
+  # go to next hour with updated batt_inf values.
+  next_state_df <- next_state(current_state, action)
+  print(next_state_df)
+  day_ahead_hpfc_state <- next_state_df[1:13]
+  day_ahead_consumption <- next_state_df[14:26]
+  day_ahead_production <- next_state_df[27:39]
+  batt_inf <- next_state_df[40:43]
+  print(paste("consumption:", day_ahead_consumption[1]))
+  print(paste("soc", batt_inf[2]))
+  if (day_ahead_consumption[1] < 5) {
+    if (day_ahead_consumption[1] < 3) {
+      if (day_ahead_consumption[1] < 2) {
+        if (day_ahead_consumption[1] < 1) {
+          if (batt_inf[2] > 0) {
+            action <- "bat_to_grid"
+          } else {
+            action <- "bat_idle"
+          }
+        } else {
+          action <- "bat_from_pv"
+        }
+      } else if (batt_inf[2] > 0) {
+        action <- "bat_to_home"
+      } else {
+        action <- "bat_idle"
+      }
+    } else if (day_ahead_production[1] > 0) {
+      action <- "bat_from_grid"
+    } else {
+      action <- "bat_idle"
+    }
+  } else {
+    action <- "bat_idle"
+  }
+
+
+  reward_val <- reward(next_state_df, action)
+  # update policy based on the reward
+  #for now we simply print the action and reward
+  print(paste("Action:", action, "Reward:", reward_val))
+  
+  # Update the current state
+  current_state <- next_state_df
+}
+```
+
+
+
+# Let's try another approach
+```{r}
+data_rl <- data.frame(dfProductionData, dfHpfc, batt_inf, actions)
+#print(data)
+#write.csv(data,"/Users/galileo/Documents/DS/CDA1/preprocessed_data.csv", row.names=TRUE)
+
+data_rl$batt_inf <- as.character(data_rl$batt_inf)
+data_rl$actions <- as.character(data_rl$actions)
+
+states <- apply(data_rl[ , c("production.kWh", "consumption.kWh", "Value", "batt_inf")], 1, paste, collapse="-")
+#print(states)
+
+# Define the reward function
+rewardFunction <- function(state, action, nextState) {
+  # Convert state and nextState from string to data frame
+  state_df <- as.data.frame(matrix(as.numeric(unlist(strsplit(state, "-"))), nrow = 1))
+  nextState_df <- as.data.frame(matrix(as.numeric(unlist(strsplit(nextState, "-"))), nrow = 1))
+  
+  # Assign column names to match the original df data frame
+  names(state_df) <- names(df)[c("production.kWh", "consumption.kWh", "Value", "batt_inf")]
+  names(nextState_df) <- names(df)[c("production.kWh", "consumption.kWh", "Value", "batt_inf")]
+  
+  # Calculate reward using the provided reward function
+  reward_val <- reward(nextState_df, action)
+  
+  return(reward_val)
+}
+
+# TODO only 1 state that changes per iteration
+# Initialize the Q matrix
+print(states[1])
+Q <- matrix(0, nrow = length(states[1]), ncol = length(actions))
+rownames(Q) <- states
+colnames(Q) <- actions
+
+# Convert the df data frame to the format required by the ReinforcementLearning package
+
+# Create a data frame with the required columns for the ReinforcementLearning function
+
+print(rep(0, 1))
+print(data_rl)
+
+
+      
+data_rl <- data.frame(State=states, 
+                      Action=sample(actions, length(states), replace = TRUE), 
+                      Reward=rep(0, length(states)), 
+                      NextState=states)
+
+control <- list(alpha=0.1, gamma=0.9, epsilon=0.1)
+
+rl <- ReinforcementLearning(data=data_rl, 
+                            s="State", 
+                            a="Action", 
+                            r="Reward", 
+                            s_new="NextState", 
+                            Q=Q, 
+                            learningRule = "experienceReplay", 
+                            iter = 10,
+                            r.function = rewardFunction, 
+                            control = control)
+
+# View the results
+print(rl)
+
+
+```
